@@ -3,6 +3,7 @@ import time
 import uuid
 import yaml
 import jwt
+from typing import List
 from fastapi import FastAPI, Request, HTTPException, Response, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -17,7 +18,7 @@ ALLOWED_ORIGIN = "https://dash-p3az65.example.com"
 ISSUER = "https://idp.exam.local"
 AUDIENCE = "tds-oimesr4m.apps.exam.local"
 
-# REPLACE THIS WITH YOUR ACTUAL PUBLIC KEY (Keep the triple quotes!)
+# REPLACE THIS WITH YOUR ACTUAL PUBLIC KEY 
 PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2okOHspNjgA+2rTLbeuY
 cxiP/hG8C6Sb9iwg3yiLAA4HCnpITcbWCSelbvbYGuc3EbNy4xFyf5Cbj5DHJMID
@@ -29,10 +30,7 @@ dQIDAQAB
 -----END PUBLIC KEY-----"""
 
 # ==========================================
-# UNIFIED MIDDLEWARE (Dynamic CORS + Headers)
-# ==========================================
-# ==========================================
-# UNIFIED MIDDLEWARE (Dynamic CORS + Headers)
+# UNIFIED MIDDLEWARE (Strict Spec-Compliant CORS)
 # ==========================================
 @app.middleware("http")
 async def unified_middleware(request: Request, call_next):
@@ -40,39 +38,49 @@ async def unified_middleware(request: Request, call_next):
     request_id = str(uuid.uuid4())
     origin = request.headers.get("origin")
     
-    # Check if this request is for the open-CORS config endpoint
-    # (using .startswith to handle any query parameters safely)
     is_config_endpoint = request.url.path.startswith("/effective-config")
     
     # 1. Handle Preflight (OPTIONS)
     if request.method == "OPTIONS":
         response = Response(status_code=200)
         if is_config_endpoint:
-            # Open CORS for the effective-config endpoint
-            response.headers["Access-Control-Allow-Origin"] = "*"
-            response.headers["Access-Control-Allow-Methods"] = "*"
-            response.headers["Access-Control-Allow-Headers"] = "*"
+            # SPEC FIX: No "*" wildcards allowed when Credentials=true
+            response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
+            response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+            req_headers = request.headers.get("Access-Control-Request-Headers", "Content-Type, Authorization, Accept")
+            response.headers["Access-Control-Allow-Headers"] = req_headers
+            response.headers["Access-Control-Allow-Credentials"] = "true"
         elif origin == ALLOWED_ORIGIN:
-            # Strict CORS for stats and verify endpoints
             response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS" 
-            response.headers["Access-Control-Allow-Headers"] = "*"
-    else:
-        # 2. Process standard requests
-        response = await call_next(request)
-        if is_config_endpoint:
-            # Always attach wildcards for the config endpoint
-            response.headers["Access-Control-Allow-Origin"] = "*"
-        elif origin == ALLOWED_ORIGIN:
-            # Strictly attach for the others
-            response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Accept"
+            
+        process_time = time.perf_counter() - start_time
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Process-Time"] = f"{process_time:.6f}"
+        return response
 
-    # 3. Always append grading headers
+    # 2. Process Standard Requests (with Crash Protection)
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        # If the code crashes, return a 500 but KEEP the CORS headers
+        response = JSONResponse(status_code=500, content={"detail": str(e)})
+
+    # 3. Attach standard CORS response headers
+    if is_config_endpoint:
+        response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    elif origin == ALLOWED_ORIGIN:
+        response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
+
+    # 4. Attach grading headers
     process_time = time.perf_counter() - start_time
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Process-Time"] = f"{process_time:.6f}"
     
     return response
+
 
 # ==========================================
 # ENDPOINT 1: STATS CALCULATOR
@@ -97,6 +105,7 @@ def compute_stats(values: str):
         "max": max(nums),
         "mean": total_sum / count
     }
+
 
 # ==========================================
 # ENDPOINT 2: JWT VERIFIER
@@ -123,6 +132,7 @@ def verify_token(request: TokenRequest):
     except jwt.PyJWTError:
         return JSONResponse(status_code=401, content={"valid": False})
 
+
 # ==========================================
 # ENDPOINT 3: 12-FACTOR CONFIG 
 # ==========================================
@@ -135,8 +145,9 @@ def coerce_value(key: str, value: any):
         return str(value).lower() in ["true", "1", "yes", "on"]
     return str(value)
 
+# Note the change to List[str] to prevent Python version crashes
 @app.get("/effective-config")
-def get_effective_config(set: list[str] = Query(default=[])):
+def get_effective_config(set: List[str] = Query(default=[])):
     # LAYER 1: Hardcoded Defaults
     config = {
         "port": 8000,
@@ -152,7 +163,7 @@ def get_effective_config(set: list[str] = Query(default=[])):
             yaml_config = yaml.safe_load(f) or {}
             for k, v in yaml_config.items():
                 config[k] = coerce_value(k, v)
-    except FileNotFoundError:
+    except Exception:
         pass
 
     def process_env_var(key_name, val, target_config):
