@@ -32,22 +32,25 @@ dQIDAQAB
 # ==========================================
 # UNIFIED MIDDLEWARE (Strict Spec-Compliant CORS)
 # ==========================================
+# ==========================================
+# UNIFIED MIDDLEWARE (Strict Spec-Compliant CORS)
+# ==========================================
 @app.middleware("http")
 async def unified_middleware(request: Request, call_next):
     start_time = time.perf_counter()
     request_id = str(uuid.uuid4())
     origin = request.headers.get("origin")
     
-    is_config_endpoint = request.url.path.startswith("/effective-config")
+    # ADDED /analytics TO THE OPEN CORS LIST
+    is_open_endpoint = request.url.path.startswith("/effective-config") or request.url.path.startswith("/analytics")
     
     # 1. Handle Preflight (OPTIONS)
     if request.method == "OPTIONS":
         response = Response(status_code=200)
-        if is_config_endpoint:
-            # SPEC FIX: No "*" wildcards allowed when Credentials=true
+        if is_open_endpoint:
             response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
-            response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
-            req_headers = request.headers.get("Access-Control-Request-Headers", "Content-Type, Authorization, Accept")
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            req_headers = request.headers.get("Access-Control-Request-Headers", "Content-Type, Authorization, Accept, X-API-Key")
             response.headers["Access-Control-Allow-Headers"] = req_headers
             response.headers["Access-Control-Allow-Credentials"] = "true"
         elif origin == ALLOWED_ORIGIN:
@@ -59,6 +62,26 @@ async def unified_middleware(request: Request, call_next):
         response.headers["X-Request-ID"] = request_id
         response.headers["X-Process-Time"] = f"{process_time:.6f}"
         return response
+
+    # 2. Process Standard Requests (with Crash Protection)
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        response = JSONResponse(status_code=500, content={"detail": str(e)})
+
+    # 3. Attach standard CORS response headers
+    if is_open_endpoint:
+        response.headers["Access-Control-Allow-Origin"] = origin if origin else "*"
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    elif origin == ALLOWED_ORIGIN:
+        response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
+
+    # 4. Attach grading headers
+    process_time = time.perf_counter() - start_time
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time"] = f"{process_time:.6f}"
+    
+    return response
 
     # 2. Process Standard Requests (with Crash Protection)
     try:
@@ -195,3 +218,50 @@ def get_effective_config(set: List[str] = Query(default=[])):
         config["api_key"] = "****"
 
     return config
+
+from collections import defaultdict
+from fastapi import Header
+from typing import List, Optional
+
+# ==========================================
+# ENDPOINT 4: ANALYTICS AGGREGATOR
+# ==========================================
+class Event(BaseModel):
+    user: str
+    amount: float
+    ts: int
+
+class AnalyticsPayload(BaseModel):
+    events: List[Event]
+
+@app.post("/analytics")
+def process_analytics(payload: AnalyticsPayload, x_api_key: Optional[str] = Header(None)):
+    # 1. Check API Key
+    if x_api_key != "ak_62cy6l6i2cg5katg3mos1gmu":
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing API Key")
+    
+    events = payload.events
+    total_events = len(events)
+    unique_users = set()
+    user_revenue = defaultdict(float)
+    revenue = 0.0
+
+    # 2. Process the Batch
+    for event in events:
+        unique_users.add(event.user)
+        # Only aggregate positive amounts
+        if event.amount > 0:
+            revenue += event.amount
+            user_revenue[event.user] += event.amount
+    
+    # 3. Find Top User (Highest positive-amount total)
+    top_user = max(user_revenue, key=user_revenue.get) if user_revenue else ""
+
+    # 4. Return Results
+    return {
+        "email": "24f3003222@ds.study.iitm.ac.in",
+        "total_events": total_events,
+        "unique_users": len(unique_users),
+        "revenue": revenue,
+        "top_user": top_user
+    }
